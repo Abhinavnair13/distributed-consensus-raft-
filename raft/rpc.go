@@ -9,14 +9,13 @@ type rpcBridge struct {
 	handler RpcHandler
 }
 
-func (b *rpcBridge) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
+func (b *rpcBridge) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
 	return b.handler.HandleRequestVote(args, reply)
 }
-func (b *rpcBridge) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+func (b *rpcBridge) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	return b.handler.HandleAppendEntries(args, reply)
 }
 
-// handler := &rpcBridge{}
 type NetRpcTransport struct {
 	addr     string
 	listener net.Listener

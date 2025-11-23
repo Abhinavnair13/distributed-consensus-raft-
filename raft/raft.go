@@ -82,6 +82,7 @@ func (n *Node) RunElectionTimer() {
 
 	for {
 		select {
+		//This channel fires exactly once when the timer expires.
 		case <-timer.C:
 			// Timer fired. Time to start an election.
 			n.mu.Lock()
@@ -102,7 +103,7 @@ func (n *Node) RunElectionTimer() {
 			if !timer.Stop() {
 				select {
 				case <-timer.C: // Drain timer
-				default:
+				default: //prevent blocking
 				}
 			}
 			timer.Reset(getTimeout())
@@ -144,46 +145,69 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// In raft.go
+
 func (n *Node) startElection() {
 	n.mu.Lock()
-	//locking to read current term & id
+	n.currentTerm++
+	n.votedFor = n.id
+	term := n.currentTerm
 	args := &RequestVoteArgs{
-		Term:        n.currentTerm,
+		Term:        term,
 		CandidateId: n.id,
-		//Todo add last logidx, last log term
 	}
-
-	// Never hold a lock while doing a slow operation (like I/O or networking), so unlock it
 	n.mu.Unlock()
 
-	var wg sync.WaitGroup
-	votesGranted := 1 // Vote for self
+	var votesGranted int = 1
+	var voteMu sync.Mutex
+
+	n.logger.Infow("Starting election", "term", term)
 
 	for peerID, addr := range n.peers {
 		if peerID == n.id {
 			continue
 		}
 
-		wg.Add(1)
 		go func(peerID int, targetAddr string) {
-			defer wg.Done()
-
-			// --- THIS IS THE KEY ---
-			// We call the *interface*, not rpc.Dial
+			// 1. Send RPC
 			reply, err := n.transport.SendRequestVote(targetAddr, args)
-			// -------------------------
-
 			if err != nil {
-				n.logger.Errorw("Failed to send RequestVote", "err", err, "peer", peerID)
 				return
 			}
-			// ... (handle reply, count votes, become leader) ...
+
+			n.mu.Lock()
+			defer n.mu.Unlock()
+
+			// 2. Check if we are still a candidate and term hasn't changed
+			if n.state != Candidate || n.currentTerm != term {
+				return
+			}
+
+			// 3. Check if peer has a higher term
+			if reply.Term > term {
+				n.currentTerm = reply.Term
+				n.state = Follower
+				n.votedFor = -1
+				return
+			}
+
+			// 4. Count the vote
+			if reply.VoteGranted {
+				voteMu.Lock()
+				votesGranted++
+				majority := (len(n.peers))/2 + 1
+
+				// 5. Become Leader if majority reached
+				if votesGranted >= majority && n.state == Candidate {
+					n.logger.Infow("Became Leader", "term", n.currentTerm)
+					n.state = Leader
+					// Start sending heartbeats immediately!
+					go n.startHeartbeatLoop()
+				}
+				voteMu.Unlock()
+			}
 		}(peerID, addr)
 	}
-
-	wg.Wait()
-	// ... (check for majority and become leader) ...
-
 }
 
 // HandleRequestVote is the callback from the transport layer.
@@ -275,4 +299,38 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 
 	reply.Success = true
 	return nil
+}
+func (n *Node) startHeartbeatLoop() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			n.mu.Lock()
+			if n.state != Leader {
+				n.mu.Unlock()
+				return
+			}
+			term := n.currentTerm
+			leaderId := n.id
+			n.mu.Unlock()
+
+			// Send empty AppendEntries to all peers
+			for peerID, addr := range n.peers {
+				if peerID == n.id {
+					continue
+				}
+				//For a heartbeat, the Entries list is empty.
+				// It just carries the Term and LeaderID to prove to the followers that the leader is still alive and dominan
+				go func(address string) {
+					args := &AppendEntriesArgs{
+						Term:     term,
+						LeaderId: leaderId,
+					}
+					n.transport.SendAppendEntries(address, args)
+				}(addr)
+			}
+		}
+	}
 }
