@@ -76,9 +76,10 @@ func (n *Node) RunElectionTimer() {
 	getTimeout := func() time.Duration {
 		return time.Duration(2000+rand.Intn(2000)) * time.Millisecond
 	}
+	initialDuration := getTimeout()
 
-	timer := time.NewTimer(getTimeout())
-	n.logger.Infow("Starting as a Follower.", "timeout", timer.C)
+	timer := time.NewTimer(initialDuration)
+	n.logger.Infow("Starting as a Follower.", "timeout", initialDuration)
 
 	for {
 		select {

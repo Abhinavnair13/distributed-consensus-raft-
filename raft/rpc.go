@@ -5,14 +5,14 @@ import (
 	"net/rpc"
 )
 
-type rpcBridge struct {
+type RpcBridge struct {
 	handler RpcHandler
 }
 
-func (b *rpcBridge) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
+func (b *RpcBridge) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
 	return b.handler.HandleRequestVote(args, reply)
 }
-func (b *rpcBridge) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+func (b *RpcBridge) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	return b.handler.HandleAppendEntries(args, reply)
 }
 
@@ -28,7 +28,7 @@ func (t *NetRpcTransport) ListenAndServe(handler RpcHandler) error {
 	server := rpc.NewServer()
 
 	// Create the bridge and register it
-	bridge := &rpcBridge{handler: handler}
+	bridge := &RpcBridge{handler: handler}
 	if err := server.Register(bridge); err != nil {
 		return err
 	}
@@ -58,7 +58,7 @@ func (t *NetRpcTransport) SendRequestVote(targetAddr string, args *RequestVoteAr
 	defer client.Close()
 
 	var reply RequestVoteReply
-	if err := client.Call("rpcBridge.RequestVote", args, &reply); err != nil {
+	if err := client.Call("RpcBridge.RequestVote", args, &reply); err != nil {
 		return nil, err
 	}
 	return &reply, nil
@@ -71,7 +71,7 @@ func (t *NetRpcTransport) SendAppendEntries(targetAddr string, args *AppendEntri
 	}
 	defer client.Close()
 	var reply AppendEntriesReply
-	if err := client.Call("rpcBridge.AppendEntries", args, &reply); err != nil {
+	if err := client.Call("RpcBridge.AppendEntries", args, &reply); err != nil {
 		return nil, err
 	}
 	return &reply, nil
