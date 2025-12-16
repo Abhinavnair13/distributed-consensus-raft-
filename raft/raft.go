@@ -54,6 +54,11 @@ type Node struct {
 	id    int
 	peers map[int]string // Map of peer IDs to their addresses
 
+	// --- NEW LEADER STATE ---
+	// Reinitialized after election
+	nextIndex  map[int]int
+	matchIndex map[int]int
+
 	transport Transport
 	// electionReset time.Time // We'll manage timers directly
 }
@@ -202,8 +207,19 @@ func (n *Node) startElection() {
 				if votesGranted >= majority && n.state == Candidate {
 					n.logger.Infow("Became Leader", "term", n.currentTerm)
 					n.state = Leader
+
+					// Initialize leader state maps
+					n.nextIndex = make(map[int]int)
+					n.matchIndex = make(map[int]int)
+
+					// Initialize nextIndex to leader's last log index + 1
+					// (Using len(n.log) implies 0-indexed log logic for simplicity)
+					for peerID := range n.peers {
+						n.nextIndex[peerID] = len(n.log)
+						n.matchIndex[peerID] = -1 // Nothing matched yet
+					}
 					// Start sending heartbeats immediately!
-					go n.startHeartbeatLoop()
+					go n.startReplicationLoop()
 				}
 				voteMu.Unlock()
 			}
@@ -263,9 +279,8 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.logger.Debugw("Handling AppendEntries RPC (heartbeat)", "args", args)
 
-	// Rule 1: Reply false if term < currentTerm
+	// --- 1. Term Checks (Standard Raft Logic) ---
 	if args.Term < n.currentTerm {
 		reply.Term = n.currentTerm
 		reply.Success = false
@@ -277,61 +292,137 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	if args.Term > n.currentTerm {
 		n.state = Follower
 		n.currentTerm = args.Term
-		n.votedFor = -1 // -1 means null
+		n.votedFor = -1
 	}
 
-	reply.Term = n.currentTerm
-
-	// This is a valid heartbeat from a real leader
-	// If we were a Candidate, we must step down to Follower
+	// 3. If we are a Candidate and receive a valid AppendEntries from the
+	// current term leader, we must step down.
 	if n.state == Candidate {
 		n.state = Follower
 		n.logger.Info("Stepping down from Candidate to Follower")
 	}
 
-	// This is the most important part of a heartbeat:
-	// We reset our election timer because the leader is alive.
-	select {
-	case n.resetElectionTimer <- true:
-	default:
+	// We recognize the leader, so we reset the timer
+	n.resetElectionTimer <- true
+	reply.Term = n.currentTerm
+	// --- 2. Log Consistency Check (The "Gatekeeper") ---
+
+	// Check A: Do we even have the log index the leader is referring to?
+	// If Leader says "I am sending data after Index 10", and we only have 5 entries,
+	// we are missing data. We must return False so the Leader decrements nextIndex.
+	if args.PrevLogIndex >= len(n.log) {
+		reply.Success = false
+		return nil
 	}
 
-	// TODO: Add log consistency checks (Rules 3, 4, 5)
+	// Check B: Does the term match at that index?
+	// If Leader says "The entry at Index 5 was Term 2", but our entry at Index 5
+	// is Term 1, we have a conflict. We must return False.
+	// (We skip this check if PrevLogIndex is -1, which means "start of log")
+	if args.PrevLogIndex >= 0 {
+		if n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.Success = false
+			return nil
+		}
+	}
+
+	// --- 3. Append Entries (The "Write") ---
+
+	// If we survived the checks above, our log matches the Leader's up to PrevLogIndex.
+	// Now we append the new entries (if any).
+	if len(args.Entries) > 0 {
+		// We delete everything after PrevLogIndex and append the new entries.
+		// This ensures our log becomes identical to the Leader's from this point on.
+		n.log = append(n.log[:args.PrevLogIndex+1], args.Entries...)
+		n.logger.Infow("Appended entries", "count", len(args.Entries), "newLogLen", len(n.log))
+	}
+
+	// TODO: Update Commit Index (Next step)
 
 	reply.Success = true
 	return nil
 }
-func (n *Node) startHeartbeatLoop() {
-	ticker := time.NewTicker(50 * time.Millisecond)
+func (n *Node) startReplicationLoop() {
+	// Send heartbeats/replication every 50ms
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			n.mu.Lock()
-			if n.state != Leader {
-				n.mu.Unlock()
-				return
-			}
-			term := n.currentTerm
-			leaderId := n.id
+	for range ticker.C {
+		n.mu.Lock()
+		if n.state != Leader {
 			n.mu.Unlock()
+			return
+		}
+		savedTerm := n.currentTerm
+		savedLeaderID := n.id
+		n.mu.Unlock()
 
-			// Send empty AppendEntries to all peers
-			for peerID, addr := range n.peers {
-				if peerID == n.id {
-					continue
-				}
-				//For a heartbeat, the Entries list is empty.
-				// It just carries the Term and LeaderID to prove to the followers that the leader is still alive and dominan
-				go func(address string) {
-					args := &AppendEntriesArgs{
-						Term:     term,
-						LeaderId: leaderId,
-					}
-					n.transport.SendAppendEntries(address, args)
-				}(addr)
+		for peerID, addr := range n.peers {
+			if peerID == n.id {
+				continue
 			}
+
+			go func(pID int, address string) {
+				n.mu.Lock()
+				// 1. Get the next index for this follower
+				ni := n.nextIndex[pID]
+
+				// 2. Prepare the entries to send
+				var entries []LogEntry
+				prevLogIndex := ni - 1
+				prevLogTerm := -1
+
+				// Check bounds for prevLogIndex
+				if prevLogIndex >= 0 && prevLogIndex < len(n.log) {
+					prevLogTerm = n.log[prevLogIndex].Term
+				}
+
+				// If we have new entries, slice them from the log
+				if ni < len(n.log) {
+					entries = n.log[ni:]
+				}
+
+				args := &AppendEntriesArgs{
+					Term:         savedTerm,
+					LeaderId:     savedLeaderID,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					// LeaderCommit: n.commitIndex, // TODO: Add later
+				}
+				n.mu.Unlock()
+
+				reply, err := n.transport.SendAppendEntries(address, args)
+				if err != nil {
+					return
+				}
+
+				n.mu.Lock()
+				defer n.mu.Unlock()
+
+				if reply.Term > savedTerm {
+					n.state = Follower
+					n.currentTerm = reply.Term
+					n.votedFor = -1
+					return
+				}
+
+				if reply.Success {
+					// Success! Advance nextIndex and matchIndex for this peer
+					if len(entries) > 0 {
+						n.nextIndex[pID] = ni + len(entries)
+						n.matchIndex[pID] = n.nextIndex[pID] - 1
+						n.logger.Debugw("AppendEntries success", "peer", pID, "nextIndex", n.nextIndex[pID])
+					}
+				} else {
+					// Failure: Follower is behind. Decrement nextIndex and retry.
+					// This is the simplified log repair mechanism.
+					if n.nextIndex[pID] > 0 {
+						n.nextIndex[pID]--
+					}
+					n.logger.Debugw("AppendEntries rejected, decrementing nextIndex", "peer", pID, "nextIndex", n.nextIndex[pID])
+				}
+			}(peerID, addr)
 		}
 	}
 }
