@@ -46,9 +46,10 @@ type Node struct {
 	resetElectionTimer chan bool
 
 	// Volatile state on all servers
-	commitIndex int
-	lastApplied int
-	state       State
+	commitIndex   int
+	lastApplied   int
+	state         State
+	currentLeader int
 
 	// Private fields
 	id    int
@@ -425,4 +426,27 @@ func (n *Node) startReplicationLoop() {
 			}(peerID, addr)
 		}
 	}
+}
+
+// Submit attempts to append a command to the log.
+// Returns:
+// 1. success (bool): True if the command was accepted.
+// 2. leaderID (int): The ID of the current leader (if known), or -1.
+func (n *Node) Submit(command interface{}) (bool, int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader {
+		return false, n.currentLeader // Return false and point to the known leader
+	}
+
+	// Append command to local log
+	entry := LogEntry{
+		Term:    n.currentTerm,
+		Command: command,
+	}
+	n.log = append(n.log, entry)
+	n.logger.Infow("Log command received", "command", command, "index", len(n.log)-1)
+
+	return true, n.id
 }

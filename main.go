@@ -47,6 +47,7 @@ func main() {
 				log.Fatalf("Failed to start RPC server for node %d: %v", id, err)
 			}
 		}(transport, node)
+		StartHTTPServer(id, node)
 	}
 
 	// Start the Election Timers
