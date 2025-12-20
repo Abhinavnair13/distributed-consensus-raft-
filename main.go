@@ -1,62 +1,67 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"log"
 	"raft/raft"
 )
 
 func main() {
+	// 1. Parse flags
+	// Example: go run . -id 1 -n 5  (Starts Node 1 of a 5-node cluster)
+	nodeID := flag.Int("id", 1, "The ID of this node")
+	count := flag.Int("n", 3, "Total number of nodes in the cluster")
+	flag.Parse()
+
 	appCfg, err := NewConfig()
 	if err != nil {
 		log.Fatalf("Failed to initialize config: %v", err)
 	}
 
-	appCfg.Logger.Info("Initializing Raft Cluster...")
+	// 2. Dynamically Generate Topology
+	// We assume a strict convention:
+	// - RPC Port  = 8000 + ID
+	// - HTTP Port = 9000 + ID
+	peers := make(map[int]string)
 
-	// We map Node IDs to their local addresses.
-	peers := map[int]string{
-		1: "localhost:8001",
-		2: "localhost:8002",
-		3: "localhost:8003",
+	// Initialize the global HTTPPorts map from http_server.go
+	HTTPPorts = make(map[int]string)
+
+	for i := 1; i <= *count; i++ {
+		peers[i] = fmt.Sprintf("localhost:%d", 8000+i)
+		HTTPPorts[i] = fmt.Sprintf("%d", 9000+i)
 	}
 
-	nodes := make([]*raft.Node, 0)
+	// Validation
+	if _, ok := peers[*nodeID]; !ok {
+		log.Fatalf("Invalid Node ID: %d. Must be between 1 and %d", *nodeID, *count)
+	}
 
-	// We loop through the map to instantiate each node.
-	for id, addr := range peers {
-		// A. Create the Transport
-		// This tells the node how to listen on its specific port.
-		transport := raft.NewRpcTransport(addr)
+	appCfg.Logger.Infow("Starting Raft Node...", "nodeID", *nodeID, "clusterSize", *count)
 
-		// B. Create the Node Configuration
-		raftCfg := &raft.Config{
-			ID:        id,
-			Logger:    appCfg.Logger,
-			Peers:     peers,
-			Transport: transport, // Inject the transport layer
+	// 3. Configure and Start Node
+	transport := raft.NewRpcTransport(peers[*nodeID])
+	raftCfg := &raft.Config{
+		ID:        *nodeID,
+		Logger:    appCfg.Logger,
+		Peers:     peers,
+		Transport: transport,
+	}
+	node := raft.NewNode(raftCfg)
+
+	go func() {
+		if err := transport.ListenAndServe(node); err != nil {
+			log.Fatalf("Failed to start RPC server: %v", err)
 		}
+	}()
+	appCfg.Logger.Info("RPC Server started")
 
-		// C. Create the Node instances
-		node := raft.NewNode(raftCfg)
-		nodes = append(nodes, node)
+	// 4. Start HTTP Server
+	StartHTTPServer(*nodeID, node)
 
-		// D. Start the RPC Listener
-		// We run this in a goroutine because ListenAndServe is blocking.
-		go func(t *raft.NetRpcTransport, n *raft.Node) {
-			if err := t.ListenAndServe(n); err != nil {
-				log.Fatalf("Failed to start RPC server for node %d: %v", id, err)
-			}
-		}(transport, node)
-		StartHTTPServer(id, node)
-	}
+	// 5. Start Election Timer
+	go node.RunElectionTimer()
 
-	// Start the Election Timers
-	// We start these *after* all RPC servers are up to minimize connection errors.
-	appCfg.Logger.Info("Cluster initialized. Starting election timers...")
-	for _, node := range nodes {
-		go node.RunElectionTimer()
-	}
-
-	// Block forever
 	select {}
 }

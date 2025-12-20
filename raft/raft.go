@@ -74,7 +74,9 @@ func NewNode(cfg *Config) *Node {
 		peers:              cfg.Peers,
 		transport:          cfg.Transport,
 		resetElectionTimer: make(chan bool, 1),
+		currentLeader:      -1,
 	}
+
 }
 
 // RunElectionTimer starts the main loop for the Raft node.
@@ -114,7 +116,7 @@ func (n *Node) RunElectionTimer() {
 				}
 			}
 			timer.Reset(getTimeout())
-			n.logger.Debug("Election timer reset by RPC")
+			// n.logger.Debug("Election timer reset by RPC")
 		}
 	}
 }
@@ -295,6 +297,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		n.currentTerm = args.Term
 		n.votedFor = -1
 	}
+	n.currentLeader = args.LeaderId
 
 	// 3. If we are a Candidate and receive a valid AppendEntries from the
 	// current term leader, we must step down.
@@ -304,7 +307,10 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 
 	// We recognize the leader, so we reset the timer
-	n.resetElectionTimer <- true
+	select {
+	case n.resetElectionTimer <- true:
+	default:
+	}
 	reply.Term = n.currentTerm
 	// --- 2. Log Consistency Check (The "Gatekeeper") ---
 
@@ -344,7 +350,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	return nil
 }
 func (n *Node) startReplicationLoop() {
-	// Send heartbeats/replication every 50ms
+	// Send heartbeats/replication every 100ms
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 

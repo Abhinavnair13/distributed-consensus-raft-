@@ -1,4 +1,4 @@
-package client
+package main
 
 import (
 	"bufio"
@@ -43,7 +43,7 @@ func main() {
 	fmt.Print("\033[H\033[2J") // Clear screen
 	fmt.Printf("✅ Interactive Client Started (Node %d)\n", *nodeID)
 	fmt.Println("   - Input:  Type commands here.")
-	fmt.Println("   - Output: Run 'tail -f client_traffic.log' in another terminal.")
+	fmt.Println("   - Exit: Type exit to quit.")
 	fmt.Println("------------------------------------------------")
 
 	// 3. Main Loop

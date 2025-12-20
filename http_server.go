@@ -10,11 +10,8 @@ import (
 )
 
 // HTTPPorts maps Node IDs to their client-facing HTTP ports.
-var HTTPPorts = map[int]string{
-	1: "9001",
-	2: "9002",
-	3: "9003",
-}
+// We initialize this as nil; main.go will fill it on startup.
+var HTTPPorts map[int]string
 
 // RaftServer wraps the Raft node to provide HTTP handlers.
 type RaftServer struct {
@@ -23,23 +20,17 @@ type RaftServer struct {
 }
 
 // StartHTTPServer checks the port and starts the listener.
-// This is the entry point called by main.go.
 func StartHTTPServer(nodeID int, node *raft.Node) {
 	server := &RaftServer{
 		NodeID: nodeID,
 		Node:   node,
 	}
-
-	// Run in a goroutine so it doesn't block main.go
 	go server.start()
 }
 
 func (s *RaftServer) start() {
-	// Set Gin to release mode to reduce console noise
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
-
-	// Register routes
 	router.POST("/submit", s.handleSubmit)
 
 	port := HTTPPorts[s.NodeID]
@@ -50,9 +41,7 @@ func (s *RaftServer) start() {
 	}
 }
 
-// handleSubmit is the specific handler for client commands.
 func (s *RaftServer) handleSubmit(c *gin.Context) {
-	// 1. Parse Request
 	var req struct {
 		Command string `json:"command"`
 	}
@@ -61,46 +50,31 @@ func (s *RaftServer) handleSubmit(c *gin.Context) {
 		return
 	}
 
-	// 2. Submit to Raft Logic
 	success, leaderID := s.Node.Submit(req.Command)
 
 	if success {
-		// Case A: We are the leader and accepted the write.
-		c.JSON(http.StatusOK, gin.H{
-			"status": "committed",
-			"leader": s.NodeID,
-		})
+		c.JSON(http.StatusOK, gin.H{"status": "committed", "leader": s.NodeID})
 		return
 	}
-
-	// 3. Handle Failure / Redirection
 	s.handleRedirect(c, leaderID)
 }
 
-// handleRedirect calculates where the client should go next.
 func (s *RaftServer) handleRedirect(c *gin.Context, leaderID int) {
-	// Case B: Unknown leader (Election in progress)
 	if leaderID == -1 {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "Election in progress, please retry",
-		})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Election in progress"})
 		return
 	}
 
-	// Case C: Known leader -> Redirect
 	leaderPort, ok := HTTPPorts[leaderID]
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Leader configuration missing"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Leader config missing"})
 		return
 	}
 
 	leaderURL := fmt.Sprintf("http://localhost:%s/submit", leaderPort)
+	fmt.Printf("🔀 Redirecting to Leader Node %d (%s)\n", leaderID, leaderURL)
 
-	fmt.Printf("🔀 Node %d redirecting to Leader Node %d (%s)\n", s.NodeID, leaderID, leaderURL)
-
-	//  Set the Location header so the client knows WHERE to go.
 	c.Header("Location", leaderURL)
-	//  Send 307 so the client knows to RESEND the data.
 	c.JSON(http.StatusTemporaryRedirect, gin.H{
 		"error":  "Not Leader",
 		"leader": leaderID,
