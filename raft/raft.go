@@ -95,17 +95,17 @@ func (n *Node) RunElectionTimer() {
 		case <-timer.C:
 			// Timer fired. Time to start an election.
 			n.mu.Lock()
-			if n.state == Follower {
-				n.state = Candidate
-				n.currentTerm++
-				n.votedFor = n.id
-
-				n.logger.Warnw("Timed out. Becoming a Candidate.", "newTerm", n.currentTerm)
-				go n.startElection()
+			// If we are NOT a leader, we should start an election.
+			// This covers both:
+			// 1. Follower -> Candidate (Leader died)
+			// 2. Candidate -> Candidate (Election timeout/split vote - RETRY)
+			if n.state != Leader {
+				n.logger.Warn("Election timeout - Starting new election")
+				go n.startElection() // Delegate everything to this function
 			}
 			// Reset for another (potential) election
-			timer.Reset(getTimeout())
 			n.mu.Unlock()
+			timer.Reset(getTimeout())
 
 		case <-n.resetElectionTimer:
 			// We received a valid RPC. Reset the timer.
@@ -158,12 +158,14 @@ type AppendEntriesReply struct {
 
 func (n *Node) startElection() {
 	n.mu.Lock()
+	n.state = Candidate
 	n.currentTerm++
 	n.votedFor = n.id
 	term := n.currentTerm
+	savedId := n.id
 	args := &RequestVoteArgs{
 		Term:        term,
-		CandidateId: n.id,
+		CandidateId: savedId,
 	}
 	n.mu.Unlock()
 
@@ -173,7 +175,7 @@ func (n *Node) startElection() {
 	n.logger.Infow("Starting election", "term", term)
 
 	for peerID, addr := range n.peers {
-		if peerID == n.id {
+		if peerID == savedId {
 			continue
 		}
 
@@ -419,7 +421,7 @@ func (n *Node) startReplicationLoop() {
 					if len(entries) > 0 {
 						n.nextIndex[pID] = ni + len(entries)
 						n.matchIndex[pID] = n.nextIndex[pID] - 1
-						n.logger.Debugw("AppendEntries success", "peer", pID, "nextIndex", n.nextIndex[pID])
+						n.logger.Debugw("AppendEntries success", "peer", pID, "term", savedTerm, "nextIndex", n.nextIndex[pID])
 					}
 				} else {
 					// Failure: Follower is behind. Decrement nextIndex and retry.
@@ -427,7 +429,7 @@ func (n *Node) startReplicationLoop() {
 					if n.nextIndex[pID] > 0 {
 						n.nextIndex[pID]--
 					}
-					n.logger.Debugw("AppendEntries rejected, decrementing nextIndex", "peer", pID, "nextIndex", n.nextIndex[pID])
+					n.logger.Debugw("AppendEntries rejected, decrementing nextIndex", "peer", pID, "term", savedTerm, "nextIndex", n.nextIndex[pID])
 				}
 			}(peerID, addr)
 		}

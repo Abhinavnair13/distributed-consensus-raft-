@@ -75,12 +75,12 @@ func main() {
 		sendRequest(client, targetURL, text, trafficLog)
 	}
 }
-
 func sendRequest(client *http.Client, url string, command string, logger *TrafficLogger) {
 	jsonData, _ := json.Marshal(map[string]string{"command": command})
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
+		fmt.Printf("   ❌ Internal Error: %v\n", err)
 		logger.LogError(fmt.Errorf("creating request: %v", err))
 		return
 	}
@@ -88,7 +88,10 @@ func sendRequest(client *http.Client, url string, command string, logger *Traffi
 
 	start := time.Now()
 	resp, err := client.Do(req)
+
+	// Handle connection errors (e.g., node is dead)
 	if err != nil {
+		fmt.Printf("   ❌ Connection Failed: %v\n", err)
 		logger.LogError(fmt.Errorf("connection failed: %v", err))
 		return
 	}
@@ -97,6 +100,15 @@ func sendRequest(client *http.Client, url string, command string, logger *Traffi
 	body, _ := io.ReadAll(resp.Body)
 	duration := time.Since(start)
 
-	// Log the success
+	if resp.StatusCode == http.StatusOK {
+		// Clean JSON output for display
+		cleanBody := strings.TrimSpace(string(body))
+		fmt.Printf("   ✅ Success (%v): %s\n", duration.Round(time.Millisecond), cleanBody)
+	} else {
+		// Print error status
+		fmt.Printf("   ⚠️  Failed [%s] (%v): %s\n", resp.Status, duration.Round(time.Millisecond), string(body))
+	}
+
+	// Log to file
 	logger.LogResponse(resp.Status, duration, string(body))
 }
