@@ -57,17 +57,28 @@ type Node struct {
 
 	// --- NEW LEADER STATE ---
 	// Reinitialized after election
-	nextIndex  map[int]int
+	nextIndex map[int]int
+
+	//matchIndex is a specific tracking variable maintained only by the Leader.
+	// It keeps track of the highest log entry index that has been successfully replicated
+	// on each follower node.
 	matchIndex map[int]int
 
 	transport Transport
-	// electionReset time.Time // We'll manage timers directly
+
+	storage *Storage
+
+	// Apply channel: Used to notify the state machine that new data is ready
+	applyCh chan interface{}
+
+	// In-Memory Key-Value Store (The "State Machine")
+	stateMachine map[string]string
 }
 
 func NewNode(cfg *Config) *Node {
 	nodeLogger := cfg.Logger.With("nodeID", cfg.ID)
 
-	return &Node{
+	n := &Node{
 		logger:             nodeLogger,
 		state:              Follower,
 		id:                 cfg.ID,
@@ -75,8 +86,24 @@ func NewNode(cfg *Config) *Node {
 		transport:          cfg.Transport,
 		resetElectionTimer: make(chan bool, 1),
 		currentLeader:      -1,
+
+		storage:      NewStorage(cfg.ID),
+		applyCh:      make(chan interface{}, 100),
+		stateMachine: make(map[string]string),
 	}
 
+	// Load State from Disk (Crash Recovery)
+	if savedState, err := n.storage.Load(); err == nil && savedState != nil {
+		n.currentTerm = savedState.CurrentTerm
+		n.votedFor = savedState.VotedFor
+		n.log = savedState.Log
+		n.logger.Infow("Restored state from disk", "term", n.currentTerm, "logLen", len(n.log))
+	}
+
+	// Start the "Applier" (State Machine Thread)
+	go n.runApplier()
+
+	return n
 }
 
 // RunElectionTimer starts the main loop for the Raft node.
@@ -161,6 +188,7 @@ func (n *Node) startElection() {
 	n.state = Candidate
 	n.currentTerm++
 	n.votedFor = n.id
+	n.persist() // Save state to disk
 	term := n.currentTerm
 	savedId := n.id
 	args := &RequestVoteArgs{
@@ -251,6 +279,7 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 		n.state = Follower
 		n.currentTerm = args.Term
 		n.votedFor = -1 // -1 means null
+		n.persist()     // Save state to disk
 	}
 
 	reply.Term = n.currentTerm
@@ -265,6 +294,7 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	if grantVote && logIsUpToDate {
 		n.logger.Infow("Granting vote", "candidate", args.CandidateId, "term", args.Term)
 		n.votedFor = args.CandidateId
+		n.persist() // Save state to disk
 		reply.VoteGranted = true
 
 		// We granted a vote, so we must reset our timer
@@ -297,6 +327,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	if args.Term > n.currentTerm {
 		n.state = Follower
 		n.currentTerm = args.Term
+		n.persist() // Save state to disk
 		n.votedFor = -1
 	}
 	n.currentLeader = args.LeaderId
@@ -343,10 +374,20 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		// We delete everything after PrevLogIndex and append the new entries.
 		// This ensures our log becomes identical to the Leader's from this point on.
 		n.log = append(n.log[:args.PrevLogIndex+1], args.Entries...)
+		n.persist() // Save state to disk
 		n.logger.Infow("Appended entries", "count", len(args.Entries), "newLogLen", len(n.log))
 	}
 
-	// TODO: Update Commit Index (Next step)
+	if args.LeaderCommit > n.commitIndex {
+		// commitIndex = min(leaderCommit, index of last new entry)
+		indexOfLastNewEntry := len(n.log) - 1
+		if args.LeaderCommit < indexOfLastNewEntry {
+			n.commitIndex = args.LeaderCommit
+		} else {
+			n.commitIndex = indexOfLastNewEntry
+		}
+		n.triggerApply()
+	}
 
 	reply.Success = true
 	return nil
@@ -397,7 +438,7 @@ func (n *Node) startReplicationLoop() {
 					PrevLogIndex: prevLogIndex,
 					PrevLogTerm:  prevLogTerm,
 					Entries:      entries,
-					// LeaderCommit: n.commitIndex, // TODO: Add later
+					LeaderCommit: n.commitIndex,
 				}
 				n.mu.Unlock()
 
@@ -409,10 +450,12 @@ func (n *Node) startReplicationLoop() {
 				n.mu.Lock()
 				defer n.mu.Unlock()
 
+				// Rule: If RPC response contains a higher term, step down and persist
 				if reply.Term > savedTerm {
 					n.state = Follower
 					n.currentTerm = reply.Term
 					n.votedFor = -1
+					n.persist()
 					return
 				}
 
@@ -422,10 +465,36 @@ func (n *Node) startReplicationLoop() {
 						n.nextIndex[pID] = ni + len(entries)
 						n.matchIndex[pID] = n.nextIndex[pID] - 1
 						n.logger.Debugw("AppendEntries success", "peer", pID, "term", savedTerm, "nextIndex", n.nextIndex[pID])
+
+						// <--- 3. COMMIT INDEX LOGIC (The Engine) ---
+						// Check if we can advance commitIndex based on the new matchIndex
+						savedCommitIndex := n.commitIndex
+						// Look for the highest index N > commitIndex
+						for N := n.matchIndex[pID]; N > savedCommitIndex; N-- {
+							// Safety Check: Only commit entries from current term
+							if n.log[N].Term != savedTerm {
+								continue
+							}
+
+							// Count how many nodes have replicated this index
+							count := 1 // Count the leader itself
+							for _, matchIdx := range n.matchIndex {
+								if matchIdx >= N {
+									count++
+								}
+							}
+
+							// If majority reached, commit and notify applier
+							if count > len(n.peers)/2 {
+								n.commitIndex = N
+								n.logger.Infow("Leader advanced CommitIndex", "index", N)
+								n.triggerApply() // <--- Notify State Machine
+								break            // Stop checking, we found the highest N
+							}
+						}
 					}
 				} else {
 					// Failure: Follower is behind. Decrement nextIndex and retry.
-					// This is the simplified log repair mechanism.
 					if n.nextIndex[pID] > 0 {
 						n.nextIndex[pID]--
 					}
@@ -454,7 +523,46 @@ func (n *Node) Submit(command interface{}) (bool, int) {
 		Command: command,
 	}
 	n.log = append(n.log, entry)
+	n.persist() // Save state to disk
 	n.logger.Infow("Log command received", "command", command, "index", len(n.log)-1)
 
 	return true, n.id
+}
+
+// runApplier is a background goroutine that executes committed commands.
+func (n *Node) runApplier() {
+	for {
+		// Wait for signal
+		<-n.applyCh
+
+		n.mu.Lock()
+		savedLastApplied := n.lastApplied
+		savedCommitIndex := n.commitIndex
+		n.mu.Unlock()
+
+		if savedCommitIndex > savedLastApplied {
+			n.mu.Lock()
+			// Apply all entries from lastApplied+1 up to commitIndex
+			for i := savedLastApplied + 1; i <= savedCommitIndex; i++ {
+				entry := n.log[i]
+				command := entry.Command.(string)
+
+				// Apply to Key-Value Store
+				// Command format "SET key value" (simplified)
+				n.logger.Infow("EXECUTING COMMAND", "index", i, "cmd", command)
+
+				// (In a real app, you would parse "SET x 10" and update n.stateMachine)
+				n.lastApplied = i
+			}
+			n.mu.Unlock()
+		}
+	}
+}
+
+// triggerApply sends a signal to the applier without blocking
+func (n *Node) triggerApply() {
+	select {
+	case n.applyCh <- true:
+	default:
+	}
 }
