@@ -8,10 +8,9 @@ import (
 )
 
 func main() {
-	// 1. Parse flags
-	// Example: go run . -id 1 -n 5  (Starts Node 1 of a 5-node cluster)
+
 	nodeID := flag.Int("id", 1, "The ID of this node")
-	count := flag.Int("n", 3, "Total number of nodes in the cluster")
+	count := flag.Int("n", 5, "Total number of nodes in the cluster")
 	flag.Parse()
 
 	appCfg, err := NewConfig()
@@ -19,13 +18,8 @@ func main() {
 		log.Fatalf("Failed to initialize config: %v", err)
 	}
 
-	// 2. Dynamically Generate Topology
-	// We assume a strict convention:
-	// - RPC Port  = 8000 + ID
-	// - HTTP Port = 9000 + ID
 	peers := make(map[int]string)
 
-	// Initialize the global HTTPPorts map from http_server.go
 	HTTPPorts = make(map[int]string)
 
 	for i := 1; i <= *count; i++ {
@@ -33,15 +27,13 @@ func main() {
 		HTTPPorts[i] = fmt.Sprintf("%d", 9000+i)
 	}
 
-	// Validation
 	if _, ok := peers[*nodeID]; !ok {
 		log.Fatalf("Invalid Node ID: %d. Must be between 1 and %d", *nodeID, *count)
 	}
 
 	appCfg.Logger.Infow("Starting Raft Node...", "nodeID", *nodeID, "clusterSize", *count)
 
-	// 3. Configure and Start Node
-	transport := raft.NewRpcTransport(peers[*nodeID])
+	transport := raft.NewGrpcTransport(peers[*nodeID])
 	raftCfg := &raft.Config{
 		ID:        *nodeID,
 		Logger:    appCfg.Logger,
@@ -57,10 +49,8 @@ func main() {
 	}()
 	appCfg.Logger.Info("RPC Server started")
 
-	// 4. Start HTTP Server
 	StartHTTPServer(*nodeID, node)
 
-	// 5. Start Election Timer
 	go node.RunElectionTimer()
 
 	select {}

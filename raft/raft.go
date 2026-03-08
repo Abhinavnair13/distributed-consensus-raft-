@@ -191,9 +191,17 @@ func (n *Node) startElection() {
 	n.persist() // Save state to disk
 	term := n.currentTerm
 	savedId := n.id
+	lastLogIndex := len(n.log) - 1
+	lastLogTerm := -1
+	if lastLogIndex >= 0 {
+		lastLogTerm = n.log[lastLogIndex].Term
+	}
+
 	args := &RequestVoteArgs{
-		Term:        term,
-		CandidateId: savedId,
+		Term:         term,
+		CandidateId:  savedId,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
 	}
 	n.mu.Unlock()
 
@@ -288,8 +296,18 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	grantVote := (n.votedFor == -1 || n.votedFor == args.CandidateId)
 
 	// Rule 3: ... and candidate's log is at least as up-to-date
-	// (will stub this for now, as it's the next big step)
-	logIsUpToDate := true // TODO: Implement log comparison logic
+	myLastLogIndex := len(n.log) - 1
+	myLastLogTerm := -1
+	if myLastLogIndex >= 0 {
+		myLastLogTerm = n.log[myLastLogIndex].Term
+	}
+
+	logIsUpToDate := false
+	if args.LastLogTerm > myLastLogTerm {
+		logIsUpToDate = true
+	} else if args.LastLogTerm == myLastLogTerm && args.LastLogIndex >= myLastLogIndex {
+		logIsUpToDate = true
+	}
 
 	if grantVote && logIsUpToDate {
 		n.logger.Infow("Granting vote", "candidate", args.CandidateId, "term", args.Term)
@@ -297,8 +315,6 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 		n.persist() // Save state to disk
 		reply.VoteGranted = true
 
-		// We granted a vote, so we must reset our timer
-		// Use a non-blocking send in case channel is full
 		select {
 		case n.resetElectionTimer <- true:
 		default:
@@ -315,7 +331,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// --- 1. Term Checks (Standard Raft Logic) ---
+	//Term Checks (Standard Raft Logic)
 	if args.Term < n.currentTerm {
 		reply.Term = n.currentTerm
 		reply.Success = false
@@ -332,7 +348,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 	n.currentLeader = args.LeaderId
 
-	// 3. If we are a Candidate and receive a valid AppendEntries from the
+	//If we are a Candidate and receive a valid AppendEntries from the
 	// current term leader, we must step down.
 	if n.state == Candidate {
 		n.state = Follower
@@ -345,7 +361,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	default:
 	}
 	reply.Term = n.currentTerm
-	// --- 2. Log Consistency Check (The "Gatekeeper") ---
+	//  2. Log Consistency Check (The "Gatekeeper")
 
 	// Check A: Do we even have the log index the leader is referring to?
 	// If Leader says "I am sending data after Index 10", and we only have 5 entries,
@@ -366,16 +382,33 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		}
 	}
 
-	// --- 3. Append Entries (The "Write") ---
+	// Append Entries (The "Write")
 
 	// If we survived the checks above, our log matches the Leader's up to PrevLogIndex.
 	// Now we append the new entries (if any).
 	if len(args.Entries) > 0 {
-		// We delete everything after PrevLogIndex and append the new entries.
-		// This ensures our log becomes identical to the Leader's from this point on.
-		n.log = append(n.log[:args.PrevLogIndex+1], args.Entries...)
-		n.persist() // Save state to disk
-		n.logger.Infow("Appended entries", "count", len(args.Entries), "newLogLen", len(n.log))
+		insertIndex := args.PrevLogIndex + 1
+		newEntriesIndex := 0
+
+		// Find the first point of conflict or where new entries begin
+		for {
+			if insertIndex >= len(n.log) || newEntriesIndex >= len(args.Entries) {
+				break
+			}
+			if n.log[insertIndex].Term != args.Entries[newEntriesIndex].Term {
+				break // Conflict found
+			}
+			insertIndex++
+			newEntriesIndex++
+		}
+
+		if newEntriesIndex < len(args.Entries) {
+			// There is a conflict or we have new entries beyond the end of our log
+			// We only truncate and append from the divergence point
+			n.log = append(n.log[:insertIndex], args.Entries[newEntriesIndex:]...)
+			n.persist() // Save state to disk
+			n.logger.Infow("Appended entries", "count", len(args.Entries)-newEntriesIndex, "newLogLen", len(n.log))
+		}
 	}
 
 	if args.LeaderCommit > n.commitIndex {
@@ -466,7 +499,7 @@ func (n *Node) startReplicationLoop() {
 						n.matchIndex[pID] = n.nextIndex[pID] - 1
 						n.logger.Debugw("AppendEntries success", "peer", pID, "term", savedTerm, "nextIndex", n.nextIndex[pID])
 
-						// <--- 3. COMMIT INDEX LOGIC (The Engine) ---
+						//  COMMIT INDEX LOGIC (The Engine)
 						// Check if we can advance commitIndex based on the new matchIndex
 						savedCommitIndex := n.commitIndex
 						// Look for the highest index N > commitIndex
