@@ -5,7 +5,8 @@
 
 A resilient, ground-up implementation of the Raft Consensus Algorithm in Go. Built to explore the complexities of distributed systems, this project creates a highly available, fault-tolerant replicated state machine based on the paper _"In Search of an Understandable Consensus Algorithm."_
 
-**📺 [Watch the Full Project Breakdown on YouTube](INSERT_YOUR_YOUTUBE_LINK_HERE)**
+**📺 [Watch the Full Project Breakdown on YouTube](https://www.youtube.com/watch?v=UjGpPapFrKY)**
+**📕 [Research paper](https://raft.github.io/raft.pdf)**
 
 ---
 
